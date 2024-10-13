@@ -17,7 +17,7 @@ import pytz
 timezone = pytz.timezone('Europe/Moscow')
 
 scheduler = BackgroundScheduler()
-
+scheduler.start()
 
 sent_notifications = {}
 
@@ -47,13 +47,12 @@ async def save_user(connection, telegram_username, phone_number):
     return user_id
 
 
-async def save_request(connection, request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo, warehouse_ids, date_period):
-    # Убираем telegram_user_id из параметров и запроса
+async def save_request(connection, request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo, warehouse_ids, date_period, telegram_user_id):  # Добавляем telegram_user_id
     query = """
-    INSERT INTO requests (request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo, warehouse_ids, date_period)  
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9); 
+    INSERT INTO requests (request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo, warehouse_ids, date_period, telegram_user_id)  -- Добавляем telegram_user_id в запрос
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);  -- Добавляем $10 для telegram_user_id
     """
-    await connection.execute(query, request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo, warehouse_ids, date_period)
+    await connection.execute(query, request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo, warehouse_ids, date_period, telegram_user_id)  # Передаем telegram_user_id в execute
 
 def format_date(date_obj):
     return date_obj.strftime('%d.%m.%Y')
@@ -651,6 +650,7 @@ async def confirm_request(update: Update, context: CallbackContext):
 
     request_id = generate_request_id()
     requests[request_id] = user_data
+    telegram_user_id = update.effective_user.id
     delivery_type = translate_to_russian('delivery_type', user_data.get('delivery_type', 'Не выбрано'))
     date_period = user_data.get('date_period', 'Не выбран')
     period_range = get_period_range(date_period)
@@ -678,7 +678,7 @@ async def confirm_request(update: Update, context: CallbackContext):
                 f"📅 Период: {period_range}\n"
                 f"💸 Коэффициент: {user_data.get('acceptance_coefficient', 'Не выбран')}\n\n"
                 f"ID заявки: {request_id}\n\n"
-                "Оплата уже была произведена ранее, заявка подтверждена."
+                "Поиск лимитов активирован ✅"
             )
             keyboardline = [
                 [InlineKeyboardButton("Главное меню", callback_data='main_menu')],
@@ -718,23 +718,16 @@ async def confirm_request(update: Update, context: CallbackContext):
             user_data.get('acceptance_coefficient', 0),
             None,
             warehouse_ids_str, 
-            date_period
+            date_period,
+            telegram_user_id
         )
-        
-        telegram_chat_id = update.effective_user.id
-        query = """
-        UPDATE users
-        SET chat_id = $1
-        WHERE user_id = $2
-        """
-        await connection.execute(query, telegram_chat_id, user_id)
 
         context.user_data['request_id'] = request_id
         context.user_data['awaiting_receipt'] = True
         context.user_data['request']['warehouse_ids'] = warehouse_ids
         
         # Запускаем поиск лимитов, передавая все необходимые аргументы
-        await add_search_limits_job(update, context, request_id, warehouse_ids, date_period, telegram_chat_id)
+        asyncio.create_task(add_search_limits_job(update, context, request_id, warehouse_ids, date_period, telegram_user_id))  
 
         await connection.close()
         return
@@ -752,22 +745,20 @@ async def confirm_request(update: Update, context: CallbackContext):
 async def load_requests_and_start_tasks():
     try:
         connection = await init_db()
-        query = "SELECT request_id, warehouse_ids, date_period FROM requests"
+        query = "SELECT request_id, warehouse_ids, date_period, telegram_user_id FROM requests"
         requests = await connection.fetch(query)
         
         for request in requests:
             request_id = request['request_id']
             warehouse_ids = request['warehouse_ids']  
             date_period = request['date_period']  
-            query = "SELECT chat_id FROM users WHERE user_id = $1"
-            result = await connection.fetchrow(query, request['user_id'])  # Используем user_id из requests
-            telegram_chat_id = int(result['chat_id']) if result else None 
+            telegram_user_id = request['telegram_user_id']
 
-            scheduler.add_job(
+            await scheduler.add_job(
                 search_limits_task,
                 'interval',
                 seconds=60,
-                args=(None, warehouse_ids, date_period, telegram_chat_id),
+                args=(None, warehouse_ids, date_period, telegram_user_id),
                 id=f"search_limits_{request_id}"
             )
     except Exception as e:
@@ -777,7 +768,7 @@ async def load_requests_and_start_tasks():
             await connection.close()
 
 
-async def search_limits_task(update: Update, context: CallbackContext, warehouse_ids, date_period, telegram_chat_id):
+async def search_limits_task(update: Update, context: CallbackContext, warehouse_ids, date_period, telegram_user_id):
     """
     Функция для поиска лимитов.
     """
@@ -799,7 +790,7 @@ async def search_limits_task(update: Update, context: CallbackContext, warehouse
         try:
             limits_data = await get_limits(warehouse_ids)
             if limits_data:
-                await compare_limits(update, context, limits_data, telegram_chat_id,sent_notifications)
+                await compare_limits(update, context, limits_data, telegram_user_id,sent_notifications)
             else:
                 logging.error("Ошибка получения лимитов. Повторная попытка через 60 секунд.")
             await asyncio.sleep(60)  # Ожидание перед следующим запросом
@@ -831,7 +822,7 @@ async def get_limits(warehouse_ids):
                 logging.error(f"Ошибка при запросе к API WB: {response.status}")
                 return None
 
-async def compare_limits(update: Update, context: CallbackContext, limits_data, telegram_chat_id, sent_notifications):  # Добавляем sent_notifications
+async def compare_limits(update: Update, context: CallbackContext, limits_data, telegram_user_id, sent_notifications):  # Добавляем sent_notifications
     """
     Функция для сравнения полученных лимитов с запросом пользователя.
     """
@@ -886,7 +877,7 @@ async def compare_limits(update: Update, context: CallbackContext, limits_data, 
 
     # Отправляем уведомления
     for (warehouse_name, box_type_name), data in limits_by_warehouse_and_type.items():
-        key = (telegram_chat_id, warehouse_name, box_type_name)  # Ключ для sent_notifications
+        key = (telegram_user_id, warehouse_name, box_type_name)  # Ключ для sent_notifications
 
         if key not in sent_notifications:
             min_date = data['min_date']
@@ -899,15 +890,15 @@ async def compare_limits(update: Update, context: CallbackContext, limits_data, 
                 f"💸 Коэффициент: {data['limits'][0]['coefficient']}\n"
                 f"📅 Даты: {min_date} - {max_date}"
             )
-            await context.bot.send_message(chat_id=telegram_chat_id, text=message)
+            await context.bot.send_message(chat_id=telegram_user_id, text=message)
             sent_notifications[key] = True  
 
-async def add_search_limits_job(update, context, request_id, warehouse_ids, date_period, telegram_chat_id):  # Добавляем telegram_user_id
+async def add_search_limits_job(update, context, request_id, warehouse_ids, date_period, telegram_user_id):  # Добавляем telegram_user_id
     # Оборачиваем search_limits_task в синхронную функцию
     def sync_search_limits_task():
-        asyncio.run(search_limits_task(update, context, warehouse_ids, date_period, telegram_chat_id))  # Передаем telegram_user_id
+        asyncio.run(search_limits_task(update, context, warehouse_ids, date_period, telegram_user_id))  # Передаем telegram_user_id
 
-    trigger = IntervalTrigger(seconds=60)  # Выполнять каждые 60 секунд
+    trigger = IntervalTrigger(seconds=120)  # Выполнять каждые 60 секунд
     scheduler.add_job(
         sync_search_limits_task,  # Передаем синхронную функцию
         trigger,
@@ -957,7 +948,7 @@ async def handle_receipt_photo(update: Update, context: CallbackContext):
     else:
         await update.message.reply_text("Вы пока не создали заявку для проверки чека.")
 
-scheduler.start()
+
   
 
 async def main_menu(update: Update, context: CallbackContext):
@@ -965,7 +956,7 @@ async def main_menu(update: Update, context: CallbackContext):
 
 
 def main():
-    application = Application.builder().token("7345975983:AAGMqp0ecosKAS9KENy4MbsHpT2cO3KOY7g").build()
+    application = Application.builder().token("7588760839:AAFQNSlWVM2TA1rXLWCQ3ZsNqAX4dwxvUKM").build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(add_request, pattern='^add_request$'))
