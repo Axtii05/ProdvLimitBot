@@ -956,7 +956,7 @@ async def main_menu(update: Update, context: CallbackContext):
 
 
 def main():
-    application = Application.builder().token("7588760839:AAFQNSlWVM2TA1rXLWCQ3ZsNqAX4dwxvUKM").build()
+    application = Application.builder().token("7345975983:AAGMqp0ecosKAS9KENy4MbsHpT2cO3KOY7g").build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(add_request, pattern='^add_request$'))
